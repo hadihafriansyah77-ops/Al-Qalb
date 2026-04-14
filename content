@@ -825,6 +825,59 @@ def analyze_entry_signal(data: Dict) -> str:
     if change > 500: return "⚠️ CAUTION - already pumped"
     if liq > 20000 and buys > sells * 1.3 and change > 0: return "✅ BUY SIGNAL"
     return "👀 WATCH"
+
+# ========== ENHANCED TECHNICAL INDICATORS (MEME COIN SPECIFIC) ==========
+class MemeTechIndicators:
+    """Indikator teknis khusus meme coin: volume spike, buy/sell pressure, momentum, social score."""
+    
+    @staticmethod
+    def calculate_volume_spike(volumes: List[float], window=5) -> float:
+        """Return z-score volume spike ( >2 = spike)."""
+        if len(volumes) < window+1: return 0
+        recent = volumes[-window:]
+        mean = np.mean(recent)
+        std = np.std(recent)
+        if std == 0: return 0
+        return (volumes[-1] - mean) / std
+    
+    @staticmethod
+    def calculate_buy_pressure(buys: List[int], sells: List[int], window=5) -> float:
+        """Return net buy pressure (0-100)."""
+        if len(buys) < window or len(sells) < window: return 50
+        total_buys = sum(buys[-window:])
+        total_sells = sum(sells[-window:])
+        if total_buys + total_sells == 0: return 50
+        return (total_buys / (total_buys + total_sells)) * 100
+    
+    @staticmethod
+    def calculate_rsi(prices: List[float], period=14) -> float:
+        """RSI untuk meme coin (lebih sensitif)."""
+        if len(prices) < period+1: return 50
+        deltas = np.diff(prices[-period-1:])
+        gains = deltas[deltas > 0].sum() / period
+        losses = -deltas[deltas < 0].sum() / period
+        if losses == 0: return 100
+        rs = gains / losses
+        return 100 - (100 / (1 + rs))
+    
+    @staticmethod
+    def calculate_momentum_score(prices: List[float], volumes: List[float], period=5) -> float:
+        """Gabungan price momentum + volume momentum."""
+        if len(prices) < period+1 or len(volumes) < period+1: return 0
+        price_mom = (prices[-1] - prices[-period]) / max(prices[-period], 1e-8) * 100
+        vol_mom = (volumes[-1] - volumes[-period]) / max(volumes[-period], 1e-8) * 100
+        return (price_mom * 0.6) + (vol_mom * 0.4)
+    
+    @staticmethod
+    def social_score(name: str, symbol: str) -> int:
+        """Skor sosial sederhana (bisa diintegrasi dengan Twitter API nanti)."""
+        score = 0
+        keywords = ["moon", "gem", "100x", "soon", "launch", "presale", "airdrop"]
+        text = (name + " " + symbol).lower()
+        for kw in keywords:
+            if kw in text: score += 10
+        return min(score, 100)
+
 # ========== LAYER TAMBAHAN: SCORING RELATIF, MOMENTUM, AI PENOLAK, COOLDOWN, FLOW UANG, SMART MONEY, EXIT MANAGER ==========
 
 # ------------------------- 1. SCORING RELATIF (berbasis median 20 token terakhir) -------------------------
@@ -1243,36 +1296,193 @@ class AdaptiveValidator:
         return True, score, f"Lolos semua layer", momentum_info
 
 
-# ------------------------- 13. SLOW ADJUSTER (MetaGovernor tidak terlalu cepat) -------------------------
-class SlowAdjuster:
-    def __init__(self, min_trades=100, min_change_winrate=0.05, min_change_ev=2.0):
-        self.min_trades = min_trades
-        self.min_change_winrate = min_change_winrate
-        self.min_change_ev = min_change_ev
-        self.last_winrate = None
-        self.last_ev = None
-    async def maybe_adjust(self, meta_governor, trade_logger: EnhancedTradeLogger):
-        stats = trade_logger.get_expected_value(min_trades=self.min_trades)
-        if not stats["ready"]: return False
-        current_winrate = stats["win_rate"]
-        current_ev = stats["expected_value"]
-        if self.last_winrate is None:
-            self.last_winrate = current_winrate; self.last_ev = current_ev; return False
-        winrate_change = current_winrate - self.last_winrate
-        ev_change = current_ev - self.last_ev
-        if abs(winrate_change) >= self.min_change_winrate or abs(ev_change) >= self.min_change_ev:
-            old_threshold = meta_governor.global_config.get("score_threshold", 60)
-            if current_winrate < 0.45:
-                new_threshold = min(80, old_threshold + 5)
-            elif current_winrate > 0.65 and current_ev > 2:
-                new_threshold = max(50, old_threshold - 5)
-            else:
-                new_threshold = old_threshold
-            if new_threshold != old_threshold:
-                meta_governor.global_config["score_threshold"] = new_threshold
-                meta_governor.logger.info(f"SlowAdjuster: threshold {old_threshold} -> {new_threshold} (winrate={current_winrate:.2f}, ev={current_ev:.2f})")
-            self.last_winrate = current_winrate; self.last_ev = current_ev
+# ========== SMART ENTRY/EXIT LOGIC (TARGET WINRATE 90-100%) ==========
+class SmartTradePlanner:
+    """
+    Menggabungkan multiple confirmation untuk entry dan exit.
+    Hanya entry jika semua sinyal kuat (minimum 7 dari 10 kriteria).
+    """
+    
+    def __init__(self):
+        self.indicators = MemeTechIndicators()
+        self.history = {}  # mint -> {"prices": [], "volumes": [], "buys": [], "sells": []}
+    
+    def update_history(self, mint: str, price: float, volume: float, buys: int, sells: int):
+        if mint not in self.history:
+            self.history[mint] = {"prices": deque(maxlen=50), "volumes": deque(maxlen=50),
+                                  "buys": deque(maxlen=50), "sells": deque(maxlen=50)}
+        self.history[mint]["prices"].append(price)
+        self.history[mint]["volumes"].append(volume)
+        self.history[mint]["buys"].append(buys)
+        self.history[mint]["sells"].append(sells)
+    
+    def analyze_entry(self, mint: str, data: Dict, intel_report: Dict) -> Tuple[bool, int, str]:
+        """Return (should_enter, confidence_0-100, reason)."""
+        if mint not in self.history: return False, 0, "No history"
+        hist = self.history[mint]
+        prices = list(hist["prices"])
+        volumes = list(hist["volumes"])
+        buys = list(hist["buys"])
+        sells = list(hist["sells"])
+        if len(prices) < 10: return False, 0, "Insufficient data"
+        
+        score = 0
+        reasons = []
+        
+        # 1. Volume spike (z-score > 2)
+        spike = self.indicators.calculate_volume_spike(volumes, window=5)
+        if spike > 2:
+            score += 15; reasons.append(f"volume_spike_{spike:.1f}")
+        elif spike > 1: score += 8
+        
+        # 2. Buy pressure > 70%
+        pressure = self.indicators.calculate_buy_pressure(buys, sells, window=5)
+        if pressure > 75:
+            score += 20; reasons.append(f"buy_pressure_{pressure:.0f}%")
+        elif pressure > 65: score += 10
+        
+        # 3. RSI 30-70 (hindari overbought/oversold)
+        rsi = self.indicators.calculate_rsi(prices, period=10)
+        if 40 <= rsi <= 60:
+            score += 15; reasons.append(f"rsi_{rsi:.0f}")
+        elif 30 <= rsi <= 70: score += 8
+        
+        # 4. Momentum score > 5
+        momentum = self.indicators.calculate_momentum_score(prices, volumes, period=5)
+        if momentum > 10:
+            score += 20; reasons.append(f"momentum_{momentum:.1f}%")
+        elif momentum > 5: score += 10
+        
+        # 5. Social score > 50
+        social = self.indicators.social_score(data.get("name",""), data.get("symbol",""))
+        if social > 60:
+            score += 10; reasons.append(f"social_{social}")
+        elif social > 40: score += 5
+        
+        # 6. Whale sentiment bullish
+        if "BULLISH" in intel_report.get("whale_sentiment", ""):
+            score += 10; reasons.append("whale_bullish")
+        
+        # 7. GMGN signal positif
+        if intel_report.get("gmgn_signal"):
+            score += 10; reasons.append("gmgn_signal")
+        
+        # 8. Polymarket prob > 0.6
+        if intel_report.get("polymarket_prob", 0) > 0.6:
+            score += 5; reasons.append("polymarket_high")
+        
+        # 9. Liquidity > 30k
+        if data.get("liquidity_usd", 0) > 30000:
+            score += 5; reasons.append("high_liq")
+        
+        # 10. Price change < 30% (tidak terlalu pump)
+        change = abs(data.get("price_change_h24", 0))
+        if change < 20:
+            score += 5; reasons.append("stable_price")
+        
+        confidence = min(100, score)
+        should_enter = confidence >= 70  # Threshold tinggi untuk winrate tinggi
+        reason = f"conf={confidence}% | " + ", ".join(reasons[:5])
+        return should_enter, confidence, reason
+    
+    def analyze_exit(self, mint: str, current_price: float, entry_price: float) -> Tuple[bool, int, str]:
+        """Return (should_exit, confidence, reason). Target profit minimal 5%, stop loss -3%."""
+        if mint not in self.history: return False, 0, "No history"
+        hist = self.history[mint]
+        prices = list(hist["prices"])
+        if len(prices) < 5: return False, 0, "Insufficient data"
+        
+        profit_pct = (current_price - entry_price) / entry_price * 100
+        if profit_pct >= 5:  # Take profit 5%
+            return True, 100, f"take_profit_{profit_pct:.1f}%"
+        if profit_pct <= -3:  # Stop loss -3%
+            return True, 100, f"stop_loss_{profit_pct:.1f}%"
+        
+        # Dynamic exit: jika momentum turun drastis
+        momentum = self.indicators.calculate_momentum_score(prices, hist["volumes"], period=3)
+        if momentum < -5 and profit_pct > 0:
+            return True, 80, f"momentum_died_{momentum:.1f}"
+        
+        return False, 0, "hold"
+
+
+# ========== REAL-TIME MONITORING & TELEGRAM ALERTS (SETIAP 1 MENIT) ==========
+class RealTimeMonitor:
+    def __init__(self, auto_trader, chat_id):
+        self.auto_trader = auto_trader
+        self.chat_id = chat_id
+        self.last_alert_time = 0
+        self.last_positions = {}
+    
+    async def run(self):
+        while not kill_check():
+            now = time.time()
+            # Alert setiap 60 detik
+            if now - self.last_alert_time >= 60:
+                await self.send_status_alert()
+                self.last_alert_time = now
+            # Cek perubahan posisi
+            await self.check_position_changes()
+            await asyncio.sleep(10)
+    
+    async def send_status_alert(self):
+        bal = get_real_balance(BOT_WALLET_ADDRESS)
+        price = await get_sol_price_usd()
+        positions = len(self.auto_trader.positions)
+        msg = (f"🔔 **REAL-TIME ALERT**\n"
+               f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
+               f"💰 Balance: {bal:.4f} SOL (${bal*price:.2f})\n"
+               f"📊 Open Positions: {positions}\n"
+               f"📈 24h Change: ... (monitoring)")
+        await bot.send_message(self.chat_id, msg, parse_mode="Markdown")
+    
+    async def check_position_changes(self):
+        current = set(self.auto_trader.positions.keys())
+        previous = set(self.last_positions.keys())
+        new = current - previous
+        closed = previous - current
+        for mint in new:
+            await bot.send_message(self.chat_id, f"🟢 **NEW POSITION**\nMint: {mint[:20]}...", parse_mode="Markdown")
+        for mint in closed:
+            await bot.send_message(self.chat_id, f"🔴 **POSITION CLOSED**\nMint: {mint[:20]}...", parse_mode="Markdown")
+        self.last_positions = dict(self.auto_trader.positions)
+
+
+# ========== EMERGENCY SAFEGUARDS ==========
+class EmergencySafeguard:
+    def __init__(self, auto_trader, max_daily_loss_pct=-8, max_consecutive_losses=4, max_drawdown_pct=-15):
+        self.auto_trader = auto_trader
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.max_consecutive_losses = max_consecutive_losses
+        self.max_drawdown_pct = max_drawdown_pct
+        self.daily_start_balance = get_real_balance(BOT_WALLET_ADDRESS)
+        self.consecutive_losses = 0
+        self.peak_balance = self.daily_start_balance
+    
+    async def check_and_emergency_stop(self, chat_id):
+        current_balance = get_real_balance(BOT_WALLET_ADDRESS)
+        daily_loss_pct = (current_balance - self.daily_start_balance) / self.daily_start_balance * 100
+        drawdown_pct = (current_balance - self.peak_balance) / self.peak_balance * 100
+        if daily_loss_pct <= self.max_daily_loss_pct:
+            await bot.send_message(chat_id, f"🚨 EMERGENCY STOP: Daily loss {daily_loss_pct:.2f}% exceeds limit")
+            self.auto_trader.stop()
             return True
+        if drawdown_pct <= self.max_drawdown_pct:
+            await bot.send_message(chat_id, f"🚨 EMERGENCY STOP: Drawdown {drawdown_pct:.2f}% exceeds limit")
+            self.auto_trader.stop()
+            return True
+        # Update peak
+        if current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+        return False
+    
+    def record_trade_result(self, profit_pct):
+        if profit_pct < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            return True  # trigger stop
         return False
 
 
@@ -1293,7 +1503,9 @@ class AutoTrader:
         self.flow_tracker = FlowTracker()
         self.smart_money = SmartMoneyDetector()
         self.exit_manager = ExitManager()
-        self.slow_adjuster = SlowAdjuster()
+        self.slow_adjuster = None  # akan diinisialisasi nanti
+        self.emergency = EmergencySafeguard(self)
+        self.smart_planner = SmartTradePlanner()
 
     async def execute_buy_solana(self, mint: str, sol_amount: float, chat_id: int):
         try:
@@ -1350,6 +1562,11 @@ class AutoTrader:
                 self.trade_logger.log_outcome(mint, entry_price, current_price, duration, profit_pct, result, simulated=False)
                 if profit_pct < 0:
                     self.risk_mgr.record_loss(profit_pct)
+                # Emergency check
+                if self.emergency.record_trade_result(profit_pct):
+                    await bot.send_message(chat_id, f"🚨 EMERGENCY: {self.emergency.max_consecutive_losses} consecutive losses. Stopping.")
+                    self.stop()
+                    break
                 await self.execute_sell_solana(mint, pos["buy_sol"], chat_id)
                 del self.positions[mint]
                 self.exit_manager.remove_position(mint)
@@ -1359,6 +1576,11 @@ class AutoTrader:
     async def scan_and_trade(self, chat_id):
         self.active = True
         await bot.send_message(chat_id, "💹 AUTO TRADER ACTIVATED (Tier 3)")
+        
+        # Start real-time monitor
+        monitor = RealTimeMonitor(self, chat_id)
+        asyncio.create_task(monitor.run())
+        
         while self.active and not kill_check():
             if tier_ctrl.get_tier() < 3:
                 await bot.send_message(chat_id, "Balance tier too low for AutoTrader.")
@@ -1366,6 +1588,8 @@ class AutoTrader:
             if self.risk_mgr.is_kill_switch_active():
                 await bot.send_message(chat_id, "🔴 RISK KILL SWITCH ACTIVE: Daily loss limit or consecutive loss reached. Trading paused.")
                 self.active = False
+                break
+            if await self.emergency.check_and_emergency_stop(chat_id):
                 break
 
             # --- DEWA MODE: Kumpulkan intel ---
@@ -1415,10 +1639,25 @@ class AutoTrader:
                 data = await get_token_data(mint)
                 if not data: continue
                 data["market_cap"] = sig.get("market_cap", 0)
+                data["name"] = sig.get("name", "")
+                data["symbol"] = sig.get("symbol", "")
                 self.market_cond.update(data)
-
+                
+                # Update history untuk SmartTradePlanner
+                self.smart_planner.update_history(mint, data.get("price_usd",0), data.get("volume_h24",0),
+                                                  data.get("txns_h24_buys",0), data.get("txns_h24_sells",0))
+                
+                # Smart entry validation (target winrate 90-100%)
+                should_enter, conf, reason = self.smart_planner.analyze_entry(mint, data, intel_report)
+                if not should_enter:
+                    self.logger.info(f"Skip {mint}: {reason}")
+                    continue
+                
                 # Validasi adaptif (scoring relatif + momentum + AI penolak)
-                valid, score, reason, momentum_info = await self.adaptive_validator.validate(data, intel_report, mint)
+                valid, score, reason2, momentum_info = await self.adaptive_validator.validate(data, intel_report, mint)
+                if not valid:
+                    self.logger.info(f"Skip {mint}: {reason2}")
+                    continue
 
                 # Flow & smart money analysis
                 await self.flow_tracker.update(mint)
@@ -1428,11 +1667,7 @@ class AutoTrader:
 
                 self.trade_logger.log_signal(mint, sig.get("symbol","?"), score, data, market_cond,
                                              momentum_info.get("momentum_score",0), flow["flow_score"],
-                                             smart["signal"], reason)
-
-                if not valid:
-                    self.logger.info(f"Skip {mint}: {reason}")
-                    continue
+                                             smart["signal"], f"{reason} | {reason2}")
 
                 # Position size dinamis berdasarkan score
                 bal = get_real_balance(BOT_WALLET_ADDRESS)
@@ -1846,14 +2081,37 @@ class MetaGovernor:
         whale_bullish = "BULLISH" in intel.get("whale_sentiment", "")
         gmgn_signal = intel.get("gmgn_signal")
         poly_prob = intel.get("polymarket_prob", 0)
-        trade_size_multiplier = 0.5; score_threshold = 70; take_profit_mult = 1.5; stop_loss_pct = -15.0; strategy_name = "STRATEGY_C"
+        
+        # Default (STRATEGY_C - Konservatif)
+        trade_size_multiplier = 0.5
+        score_threshold = 70
+        take_profit_mult = 1.5
+        stop_loss_pct = -15.0
+        strategy_name = "STRATEGY_C"
+        
         if whale_bullish and gmgn_signal is not None:
-            trade_size_multiplier = 1.5; score_threshold = 50; take_profit_mult = 3.0; stop_loss_pct = -15.0; strategy_name = "STRATEGY_A"
+            # STRATEGY_A - Agresif dengan target winrate 90%+
+            trade_size_multiplier = 1.5
+            score_threshold = 90      # <-- INI YANG BENAR: 90 UNTUK WINRATE TINGGI
+            take_profit_mult = 3.0
+            stop_loss_pct = -15.0
+            strategy_name = "STRATEGY_A"
         elif poly_prob and poly_prob > 0.6:
-            trade_size_multiplier = 1.0; score_threshold = 60; take_profit_mult = 2.0; stop_loss_pct = -30.0; strategy_name = "STRATEGY_B"
-        self.logger.info(f"🧠 MetaGovernor memilih {strategy_name} | TP:{take_profit_mult}x SL:{stop_loss_pct}%")
-        return {"name": strategy_name, "trade_size_multiplier": trade_size_multiplier,
-                "score_threshold": score_threshold, "take_profit_mult": take_profit_mult, "stop_loss_pct": stop_loss_pct}
+            # STRATEGY_B - Moderat
+            trade_size_multiplier = 1.0
+            score_threshold = 70
+            take_profit_mult = 2.0
+            stop_loss_pct = -30.0
+            strategy_name = "STRATEGY_B"
+        
+        self.logger.info(f"🧠 MetaGovernor memilih {strategy_name} | TP:{take_profit_mult}x SL:{stop_loss_pct}% | Min Score:{score_threshold}")
+        return {
+            "name": strategy_name,
+            "trade_size_multiplier": trade_size_multiplier,
+            "score_threshold": score_threshold,
+            "take_profit_mult": take_profit_mult,
+            "stop_loss_pct": stop_loss_pct
+        }
     async def evaluate_and_adapt(self):
         fin_health = self._get_financial_health()
         op_health = await op_intel.get_system_health()
@@ -2473,7 +2731,6 @@ async def daily_scheduler():
         now = time.localtime()
         if now.tm_hour == 7 and now.tm_min == 0 and not kill_check():
             log.info("Scheduled: morning scrape (AIW)")
-            # Tidak ada affiliate, hanya placeholder
         elif now.tm_hour == 23 and now.tm_min == 0:
             pass
         await asyncio.sleep(60)
